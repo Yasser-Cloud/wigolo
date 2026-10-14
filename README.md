@@ -1,5 +1,9 @@
 # Wigolo Arabic Fork — Patch Notes
 
+[Sponsor](https://wigolo.app/go/testmu/?ref=readme-top)
+
+This patch keeps OpenCode and other agent integrations working.
+
 ## Why this fork exists
 
 Wigolo (https://github.com/KnockOutEZ/wigolo) is an excellent Node.js web search orchestrator, but its Arabic support was weak in three specific ways that affected the NEXUS RAG downstream:
