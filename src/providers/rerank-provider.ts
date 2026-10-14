@@ -27,6 +27,8 @@ export interface RerankProvider {
     candidates: RerankCandidate[],
     topK?: number,
   ): Promise<RerankResult[]>;
+  /** Model warmup (optional; providers without a warmup no-op). */
+  warmup?(): Promise<void>;
   /** Model identifier (for cache invalidation / provenance). */
   readonly modelId: string;
 }
@@ -101,8 +103,11 @@ export function getRerankProvider(query?: string): Promise<RerankProvider> {
     : import('../search/reranker/transformers-rerank-provider.js')
   )
     .then(async (m) => {
-      const provider = new m.TransformersRerankProvider();
-      await withFetchRetry(() => provider.warmup());
+      const Provider = useArabic
+        ? (m as { ArabicRerankProvider: new () => RerankProvider }).ArabicRerankProvider
+        : (m as { TransformersRerankProvider: new () => RerankProvider }).TransformersRerankProvider;
+      const provider = new Provider();
+      await withFetchRetry(() => provider.warmup?.() ?? Promise.resolve());
       log.info('rerank provider ready', {
         provider: 'rerank',
         impl: useArabic ? 'arabic-hybrid' : 'transformers',
