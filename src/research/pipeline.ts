@@ -117,7 +117,8 @@ export async function runResearchPipeline(
           effEngines.map(async (engine) => {
             if (signal.aborted) return;
             try {
-              const rs = await engine.search(subQuery, engineOpts);
+              const searchQuery = preprocessQueryForSearch(subQuery).searchQuery;
+              const rs = await engine.search(searchQuery, engineOpts);
               for (const r of rs) results.push(r);
               usedHere.add(engine.name);
             } catch (err) {
