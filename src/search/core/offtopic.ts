@@ -1,30 +1,22 @@
-// Foreign-script / off-topic detection for whole result batches.
+// Foreign-script detection for whole result batches.
 //
 // WHY THIS EXISTS
-// A single misbehaving engine can poison an otherwise healthy search. The
-// classic shape: a non-English query comes back with ONE engine answering,
-// and that engine returns pages in a completely different language/topic
-// (e.g. "سيدة الشاشة العربية" answered with Google Chrome download pages).
-// The results LOOK valid — a non-empty title, a URL, a snippet — so every
-// count-based health check ("did the engine return anything?") passes, and
-// the junk is then written to the persistent search cache and replayed for
-// the whole TTL.
+// The ranking gates are lexical: a result that shares no token with the
+// query is treated as off-topic. That works for Latin-script queries, but
+// the failure mode for a non-Latin query is louder — the engine answers in
+// ANOTHER language, so nothing in the payload shares the query's script at
+// all. A classic shape: an Arabic query answered by one engine with
+// unrelated English pages. Those rows are well-formed (title, URL, snippet),
+// so every count-based health check passes, and the junk is then written to
+// the persistent search cache and replayed for the whole TTL.
 //
-// WHY SCRIPT-AWARE AND NOT PURELY LEXICAL
-// Wigolo already has lexical quality gates (tier-0 demotion, score floor)
-// and those gates are calibrated for English: for a Latin-script query an
-// English result that shares no token with the query is junk, and the
-// existing machinery already demotes it. For a NON-Latin query the failure
-// mode is different and much louder — the engine answers in another
-// language entirely, so NOTHING in the payload shares the query's script.
-//
-// So the gate here is: "the query is written in a non-Latin script and NOT
-// ONE result is written in that script" -> the engine answered in the wrong
-// language, and the whole payload is noise.
+// The gate here is: "the query is written in a non-Latin script and NOT ONE
+// result is written in that script" -> the engine answered in the wrong
+// language and the payload is noise.
 //
 // Latin-script queries are deliberately left untouched: their junk is
 // already handled by the existing (English-calibrated) gates, and changing
-// that behaviour would break the established contract for every caller.
+// that behaviour would change the contract for every caller.
 //
 // The gate is script-generic: Arabic, Hebrew, Cyrillic, Greek, Devanagari,
 // Thai, Kana, Han and Hangul are all covered by the same rule.
@@ -76,26 +68,22 @@ export function isForeignScriptBatch(query: string, results: AlignableResult[]):
   if (!results || results.length === 0) return false;
   if (!hasContentTokens(query)) return false;
   const script = detectNonLatinScript(query);
-  if (!script) return false; // Latin query — existing (English-calibrated) gates own this.
+  if (!script) return false; // Latin query — the existing gates own this.
+  // MIXED-script query (e.g. Arabic + "docker"): the Latin part is a
+  // content token of its own, so an all-Latin result set is a legitimate
+  // answer — the query's language does not pin the answer's language.
+  if (LATIN_RE.test(query)) return false;
   return results.every(
     (r) => !containsScript(`${r.title ?? ''} ${r.snippet ?? ''}`, script),
   );
 }
 
-/**
- * True when the result carries no character from the query's script AND
- * shares no content token with the query — i.e. it is a page in another
- * language about something else. Always false for Latin-script queries
- * (their junk is handled by the existing English-calibrated gates).
- */
-export function isForeignScriptResult(query: string, result: AlignableResult): boolean {
-  if (!hasContentTokens(query)) return false;
-  const script = detectNonLatinScript(query);
-  if (!script) return false;
-  const text = `${result.title ?? ''} ${result.snippet ?? ''}`;
-  if (containsScript(text, script)) return false;
-  return lexicalAlignment(query, result.title ?? '', result.snippet ?? '') === 0;
-}
+const LATIN_RE = /[A-Za-z]/;
+
+// Scripts the shared ranking tokenizer ALREADY covers (Han, Kana, Hangul).
+// Their alignment is meaningful, so the demotion below must not change
+// their ranking.
+const TOKENIZER_COVERED_SCRIPTS = new Set(['han', 'kana', 'hangul']);
 
 /**
  * Sink the rows that cannot be about the query instead of dropping them: for
@@ -103,44 +91,20 @@ export function isForeignScriptResult(query: string, result: AlignableResult): b
  * query is almost certainly noise (another language, another topic). It is
  * demoted (score x factor) rather than removed — a degraded pool may have
  * produced nothing else — so the score floor can trim it and the on-topic
- * rows keep the top slots. Latin-script queries are untouched (their junk
- * is handled by the existing English-calibrated gates).
+ * rows keep the top slots. Latin-script queries are untouched, and so are
+ * the scripts the tokenizer already handles (CJK).
  */
-export function demoteUnalignedResults<T extends AlignableResult & { relevance_score: number }>(
-  query: string,
-  results: T[],
-  factor = 0.05,
-): T[] {
+export function demoteUnalignedResults<
+  T extends AlignableResult & { relevance_score: number },
+>(query: string, results: T[], factor = 0.05): T[] {
   if (!results || results.length === 0) return results;
   if (!hasContentTokens(query)) return results;
-  if (!detectNonLatinScript(query)) return results;
+  const script = detectNonLatinScript(query);
+  if (!script) return results;
+  if (TOKENIZER_COVERED_SCRIPTS.has(script)) return results;
   return results.map((r) =>
     lexicalAlignment(query, r.title ?? '', r.snippet ?? '') === 0
       ? { ...r, relevance_score: r.relevance_score * factor }
       : r,
-  );
-}
-
-/**
- * True when EVERY result in the batch shares no content token with the
- * query. Used as the strict lexical signal (independent of script).
- */
-export function isOffTopicBatch(query: string, results: AlignableResult[]): boolean {
-  if (!results || results.length === 0) return false;
-  if (!hasContentTokens(query)) return false;
-  return results.every(
-    (r) => lexicalAlignment(query, r.title ?? '', r.snippet ?? '') === 0,
-  );
-}
-
-/**
- * True when at least one result in the batch shares a content token with the
- * query. A payload with no on-topic row is never worth caching.
- */
-export function hasOnTopicResult(query: string, results: AlignableResult[]): boolean {
-  if (!results || results.length === 0) return false;
-  if (!hasContentTokens(query)) return true;
-  return results.some(
-    (r) => lexicalAlignment(query, r.title ?? '', r.snippet ?? '') > 0,
   );
 }

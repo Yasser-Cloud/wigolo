@@ -8,6 +8,7 @@
  * but it is no longer wired in.
  */
 import { createLogger } from '../logger.js';
+import { getConfig } from '../config.js';
 import { isArabicQuery } from '../search/arabic/query-cleaner.js';
 
 const log = createLogger('providers');
@@ -99,12 +100,22 @@ export function getRerankProvider(query?: string): Promise<RerankProvider> {
   const useArabic = query ? isArabicQuery(query) : false;
   const cached = useArabic ? cachedArabic : cachedNonArabic;
   if (cached) return cached;
-
+  const config = getConfig();
   const initializing = (useArabic
     ? import('../search/reranker/arabic-rerank-provider.js')
     : import('../search/reranker/transformers-rerank-provider.js')
   )
     .then(async (m) => {
+      if (!useArabic && config.reranker === 'remote') {
+        const { RemoteRerankProvider } = await import('../search/reranker/remote-rerank-provider.js');
+        const remote = new RemoteRerankProvider(config);
+        log.info('rerank provider ready', {
+          provider: 'rerank',
+          impl: 'remote',
+          modelId: remote.modelId,
+        });
+        return remote;
+      }
       const Provider = useArabic
         ? (m as { ArabicRerankProvider: new () => RerankProvider }).ArabicRerankProvider
         : (m as { TransformersRerankProvider: new () => RerankProvider }).TransformersRerankProvider;

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { lexicalAlignment, hasContentTokens } from '../../../../src/search/core/lexical-alignment.js';
+import { lexicalAlignment } from '../../../../src/search/core/lexical-alignment.js';
 
 describe('lexicalAlignment', () => {
   it('returns 0 when title and snippet share no query tokens', () => {
@@ -56,41 +56,12 @@ describe('lexicalAlignment', () => {
     expect(a).toBe(1);
   });
 
-  // The gate used to be ASCII-only, so an Arabic query produced an empty
-  // token set and every alignment-based quality gate stayed inert for
-  // non-English queries. These cases pin the script-agnostic behaviour.
-  it('aligns Arabic queries against Arabic results', () => {
-    const a = lexicalAlignment(
-      'سيدة الشاشة العربية',
-      'فاتن حمامة - ويكيبيديا',
-      'سيدة الشاشة العربية سعاد حسني',
-    );
-    expect(a).toBeGreaterThan(0);
-  });
+  it('scores a topically aligned CJK result above unrelated fresh content', () => {
+    const query = '北京人工智能大会最新消息';
+    const relevant = lexicalAlignment(query, '北京人工智能大会发布最新成果', '大模型产业动态');
+    const irrelevant = lexicalAlignment(query, '今日黄历与北京天气预报', '出行和生活指数');
 
-  it('scores an off-topic English page as 0 for an Arabic query', () => {
-    const a = lexicalAlignment(
-      'سيدة الشاشة العربية',
-      'Google Chrome - The Fast & Secure Web Browser',
-      'Download now and make it yours.',
-    );
-    expect(a).toBe(0);
-  });
-
-  it('ignores Arabic diacritics and letter variants', () => {
-    expect(lexicalAlignment('سيدة الشاشة', 'سيّدة الشاشة', '')).toBeGreaterThan(0);
-    expect(lexicalAlignment('منتخب مصر', 'منتخب مصري', '')).toBeGreaterThan(0);
-  });
-});
-
-describe('hasContentTokens', () => {
-  it('is true for a query with real content words', () => {
-    expect(hasContentTokens('سيدة الشاشة العربية')).toBe(true);
-    expect(hasContentTokens('pgvector hnsw')).toBe(true);
-  });
-
-  it('is false for a stopword-only query (English and Arabic)', () => {
-    expect(hasContentTokens('what is the')).toBe(false);
-    expect(hasContentTokens('من في على')).toBe(false);
+    expect(relevant).toBeGreaterThan(0);
+    expect(relevant).toBeGreaterThan(irrelevant);
   });
 });

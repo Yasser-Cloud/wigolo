@@ -1,21 +1,21 @@
 import { describe, it, expect } from 'vitest';
 import {
   isForeignScriptBatch,
-  isOffTopicBatch,
-  hasOnTopicResult,
   demoteUnalignedResults,
 } from '../../../../src/search/core/offtopic.js';
+import { lexicalAlignment, hasContentTokens } from '../../../../src/search/core/lexical-alignment.js';
+import { tokenizeRankingText } from '../../../../src/search/core/text-tokenizer.js';
 
-// WHY these tests exist:
-// A single misbehaving engine can poison an otherwise healthy search. The
-// classic shape: a non-English query answered by ONE engine that returned
-// pages in a completely different language (e.g. Google Chrome download
-// pages for "سيدة الشاشة العربية"). The rows are well-formed, so every
-// count-based health check passes — the junk then gets cached and replayed.
+// WHY these tests exist
+// The ranking gates are lexical, and the shared ranking tokenizer used to
+// cover only Latin + CJK. An Arabic query therefore produced NO tokens, so
+// every alignment-based gate was inert for Arabic: a single misbehaving
+// engine could answer an Arabic query with an unrelated English payload,
+// and that payload was then cached and replayed for the whole TTL.
 //
-// The gate is script-aware: a payload answered entirely outside the query's
-// script is noise. Latin-script queries are deliberately untouched (their
-// junk is handled by the existing English-calibrated score gates).
+// The fix is script-agnostic, and the gate is script-aware: a payload
+// answered entirely outside the query's script is noise. Latin-script
+// queries are deliberately untouched.
 
 const chromePage = {
   title: 'Google Chrome - The Fast & Secure Web Browser Built to be Yours',
@@ -28,6 +28,62 @@ const hamamaPage = {
   snippet: 'سيدة الشاشة العربية سعاد حسني',
   url: 'https://ar.wikipedia.org/wiki/فاتن_حمامة',
 };
+
+describe('tokenizeRankingText', () => {
+  it('keeps Latin and CJK behaviour intact', () => {
+    expect(tokenizeRankingText('pgvector hnsw tuning')).toContain('pgvector');
+    expect(tokenizeRankingText('日本語テキスト').length).toBeGreaterThan(0);
+  });
+
+  it('emits whole Arabic words (folded, diacritics stripped)', () => {
+    const tokens = tokenizeRankingText('مُحَمَّد علي باشا');
+    expect(tokens).toContain('محمد');
+    expect(tokens).toContain('علي');
+    expect(tokens).toContain('باشا');
+  });
+
+  it('folds the Arabic orthographic variants onto one token', () => {
+    const folded = tokenizeRankingText('أحمد');
+    expect(folded).toEqual(tokenizeRankingText('احمد'));
+    expect(folded).toEqual(tokenizeRankingText('ٱحمد'));
+  });
+});
+
+describe('lexicalAlignment', () => {
+  it('aligns Arabic queries against Arabic results', () => {
+    const a = lexicalAlignment(
+      'سيدة الشاشة العربية',
+      'فاتن حمامة - ويكيبيديا',
+      'سيدة الشاشة العربية سعاد حسني',
+    );
+    expect(a).toBeGreaterThan(0);
+  });
+
+  it('scores an off-language page as 0 for an Arabic query', () => {
+    const a = lexicalAlignment(
+      'سيدة الشاشة العربية',
+      'Google Chrome - The Fast & Secure Web Browser',
+      'Download now and make it yours.',
+    );
+    expect(a).toBe(0);
+  });
+
+  it('still scores English queries as before', () => {
+    expect(lexicalAlignment('pgvector hnsw ef_search', 'pgvector hnsw ef_search tuning guide', '')).toBe(1);
+    expect(lexicalAlignment('next.js server actions caching', "Women's Clothing", 'Shop dresses')).toBe(0);
+  });
+});
+
+describe('hasContentTokens', () => {
+  it('is true for a query with real content words', () => {
+    expect(hasContentTokens('سيدة الشاشة العربية')).toBe(true);
+    expect(hasContentTokens('pgvector hnsw')).toBe(true);
+  });
+
+  it('is false for a stopword-only query', () => {
+    expect(hasContentTokens('what is the')).toBe(false);
+  });
+});
 
 describe('isForeignScriptBatch', () => {
   it('flags a payload answered entirely in another script', () => {
@@ -51,45 +107,10 @@ describe('isForeignScriptBatch', () => {
     expect(isForeignScriptBatch('سيدة الشاشة العربية', [])).toBe(false);
   });
 
-  it('covers other non-Latin scripts the same way', () => {
-    // The payload is Latin-only, so it is foreign for a Cyrillic query and
-    // for a Devanagari query alike.
-    expect(isForeignScriptBatch('как открыть', [chromePage])).toBe(true);
-    expect(isForeignScriptBatch('कैसे खोलें', [chromePage])).toBe(true);
-    // A payload in the query's own script is fine.
-    expect(
-      isForeignScriptBatch('как открыть', [{ title: 'Как открыть', snippet: '', url: 'u' }]),
-    ).toBe(false);
-  });
-});
-
-describe('isOffTopicBatch', () => {
-  it('flags a batch that shares no content token with the query', () => {
-    expect(isOffTopicBatch('سيدة الشاشة العربية', [chromePage])).toBe(true);
-  });
-
-  it('keeps a batch that shares a content token with the query', () => {
-    expect(isOffTopicBatch('سيدة الشاشة العربية', [hamamaPage])).toBe(false);
-  });
-
-  it('treats an empty batch as off-topic-free (nothing to judge)', () => {
-    expect(isOffTopicBatch('سيدة الشاشة العربية', [])).toBe(false);
-  });
-
-  it('never fires for a query with no content tokens (stopwords only)', () => {
-    expect(isOffTopicBatch('من في على', [chromePage])).toBe(false);
-    expect(isOffTopicBatch('what is the', [chromePage])).toBe(false);
-  });
-
-  it('works the same way for English queries', () => {
-    const junk = [
-      { title: "Women's Clothing", snippet: 'Shop dresses', url: 'https://shop.example/' },
-    ];
-    expect(isOffTopicBatch('pgvector hnsw tuning', junk)).toBe(true);
-    const good = [
-      { title: 'pgvector hnsw tuning guide', snippet: '', url: 'https://docs.example/pg' },
-    ];
-    expect(isOffTopicBatch('pgvector hnsw tuning', good)).toBe(false);
+  it('never fires for a MIXED-script query (Arabic + a Latin term)', () => {
+    // "تثبيت docker" is a technical query whose answers are legitimately in
+    // English — the query's language does not pin the answer's language.
+    expect(isForeignScriptBatch('تثبيت docker', [chromePage])).toBe(false);
   });
 });
 
@@ -106,28 +127,22 @@ describe('demoteUnalignedResults', () => {
 
   it('never touches a Latin-script query (existing gates own that)', () => {
     const rows = [
-      { title: 'Women\'s Clothing', snippet: 'Shop dresses', url: 'u1', relevance_score: 0.6 },
+      { title: "Women's Clothing", snippet: 'Shop dresses', url: 'u1', relevance_score: 0.6 },
     ];
-    const out = demoteUnalignedResults('pgvector hnsw tuning', rows);
-    expect(out[0].relevance_score).toBe(0.6);
+    expect(demoteUnalignedResults('pgvector hnsw tuning', rows)[0].relevance_score).toBe(0.6);
   });
 
-  it('never touches a stopword-only query (nothing to align against)', () => {
-    const rows = [{ title: 'Mayo Clinic', snippet: 'x', url: 'u1', relevance_score: 0.6 }];
-    expect(demoteUnalignedResults('من في على', rows)[0].relevance_score).toBe(0.6);
-  });
-});
-
-describe('hasOnTopicResult', () => {  it('is false when no row shares a content token with the query', () => {
-    expect(hasOnTopicResult('سيدة الشاشة العربية', [chromePage])).toBe(false);
+  it('never touches a mixed-script query (Arabic + a Latin term)', () => {
+    const rows = [
+      { title: 'Docker', snippet: 'Install Docker', url: 'u1', relevance_score: 0.6 },
+    ];
+    expect(demoteUnalignedResults('تثبيت docker', rows)[0].relevance_score).toBe(0.6);
   });
 
-  it('is true when at least one row is on-topic', () => {
-    expect(hasOnTopicResult('سيدة الشاشة العربية', [chromePage, hamamaPage])).toBe(true);
-  });
-
-  it('is true for a stopword-only query (nothing to align against)', () => {
-    expect(hasOnTopicResult('من في على', [])).toBe(false);
-    expect(hasOnTopicResult('من في على', [chromePage])).toBe(true);
+  it('never touches a CJK query (the tokenizer already covers it)', () => {
+    const rows = [
+      { title: '日本語', snippet: 'テスト', url: 'u1', relevance_score: 0.6 },
+    ];
+    expect(demoteUnalignedResults('日本語 テスト', rows)[0].relevance_score).toBe(0.6);
   });
 });

@@ -5,12 +5,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolvePythonExe } from '../python-env.js';
-import { probeBrowser } from '../fetch/browser-probe.js';
+import { probeBrowser, type BrowserName, type BrowserProbeResult } from '../fetch/browser-probe.js';
 import { getBootstrapState, type BootstrapState } from '../searxng/bootstrap.js';
 import { isProcessAlive } from '../searxng/process.js';
 import { resolveContainerCli } from '../searxng/docker.js';
 import { getConfig } from '../config.js';
+import { RemoteRerankProvider } from '../search/reranker/remote-rerank-provider.js';
 import { initDatabase, closeDatabase } from '../cache/db.js';
+import { isNativeAbiMismatch } from '../util/native-abi.js';
 import { getCacheStats } from '../cache/store.js';
 import { getBackgroundIndexQueue } from '../embedding/background-queue.js';
 import { loadFeedConfig } from '../search/core/rss/feed-config.js';
@@ -50,6 +52,17 @@ export function maskApiKey(value: string): string {
 }
 
 /**
+ * One-line rendering of an error for doctor output: the first non-empty line
+ * of the message, capped generously. The old 80-char cut hid the actionable
+ * part of most errors (#653).
+ */
+export function errorLine(err: unknown, max = 500): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  const first = msg.split(/\r?\n/).find((l) => l.trim() !== '')?.trim() ?? '';
+  return first.length > max ? `${first.slice(0, max)}…` : first;
+}
+
+/**
  * Format provider/key-location/masked-value lines for doctor output.
  * Returns one or more display lines. Key value is ALWAYS masked.
  */
@@ -83,11 +96,11 @@ function checkDocker(): { ok: boolean; version?: string; cli?: string } {
   return { ok: true, version: (r.stdout || '').trim(), cli };
 }
 
-async function checkPlaywright(): Promise<{ installed: boolean; version?: string; browsers: { chromium: boolean; chromiumHeadlessShell: boolean; firefox: boolean; webkit: boolean }; chromiumPath?: string; chromiumOnDisk: boolean; chromiumError?: string }> {
+async function checkPlaywright(): Promise<{ installed: boolean; version?: string; browsers: { chromium: boolean; chromiumHeadlessShell: boolean; firefox: boolean; webkit: boolean }; chromiumPath?: string; chromiumOnDisk: boolean; chromiumError?: string; probes: Record<BrowserName, BrowserProbeResult> }> {
   let installed = false;
   let version: string | undefined;
   try {
-    const r = spawnSync('npx', ['playwright', '--version'], { encoding: 'utf-8', timeout: 5000 });
+    const r = spawnSync('npx', ['playwright', '--version'], { encoding: 'utf-8', timeout: 30_000 });
     if (r.status === 0) {
       installed = true;
       const m = r.stdout.match(/(\d+\.\d+\.\d+)/);
@@ -120,7 +133,18 @@ async function checkPlaywright(): Promise<{ installed: boolean; version?: string
     chromiumPath: chromiumProbe.execPath || undefined,
     chromiumOnDisk: chromiumProbe.onDisk,
     chromiumError: chromiumProbe.error,
+    probes: { chromium: chromiumProbe, firefox: firefoxProbe, webkit: webkitProbe },
   };
+}
+
+/**
+ * Short per-browser status for the Browsers line. A binary that is on disk but
+ * fails its launch smoke-test is a broken install, not a missing one (#653),
+ * so the two are worded differently.
+ */
+export function browserStatusLabel(probe: BrowserProbeResult): string {
+  if (probe.launchable) return 'OK';
+  return probe.onDisk ? 'installed, failed to launch' : 'not installed';
 }
 
 // Passive cache-presence probe for the cross-encoder ML reranker. The model
@@ -286,8 +310,7 @@ export async function runEngineProbeSection(
       });
       print(`  ${name.padEnd(15)} ok (${Date.now() - t0}ms, ${results.length} results)`);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      print(`  ${name.padEnd(15)} error (${msg.slice(0, 80)})`);
+      print(`  ${name.padEnd(15)} error (${errorLine(err)})`);
     }
   }
 }
@@ -520,7 +543,11 @@ export async function runDoctorColdChecks(dataDir: string): Promise<DoctorCheck[
     name: 'browser',
     status: pw.browsers.chromium ? 'ok' : 'failed',
     fixable: true,
-    detail: pw.browsers.chromium ? 'chromium launchable' : 'chromium missing',
+    detail: pw.browsers.chromium
+      ? 'chromium launchable'
+      : pw.chromiumOnDisk
+        ? `chromium installed but failed to launch: ${errorLine(pw.chromiumError ?? 'unknown error')}`
+        : 'chromium not installed',
   });
 
   const emb = checkFastembedCache(dataDir);
@@ -685,7 +712,14 @@ async function runDoctorInner(dataDir: string, opts?: DoctorOptions): Promise<nu
   const pw = await checkPlaywright();
   out('[wigolo doctor] Browser engine:');
   out(`  Installation:  ${pw.installed ? `installed${pw.version ? ` (v${pw.version})` : ''}` : 'not installed'}`);
-  out(`  Browsers:      chromium ${pw.browsers.chromium ? 'OK' : 'missing'}  firefox ${pw.browsers.firefox ? 'OK' : 'missing'}  webkit ${pw.browsers.webkit ? 'OK' : 'missing'}`);
+  const browserNames: BrowserName[] = ['chromium', 'firefox', 'webkit'];
+  out(`  Browsers:      ${browserNames.map((b) => `${b} ${browserStatusLabel(pw.probes[b])}`).join('  ')}`);
+  for (const b of browserNames) {
+    const probe = pw.probes[b];
+    if (probe.onDisk && !probe.launchable) {
+      out(`  ${`${b}:`.padEnd(15)} failed to launch — ${errorLine(probe.error ?? 'unknown error')}`);
+    }
+  }
   if (pw.chromiumPath) {
     const onDiskNote = pw.browsers.chromium
       ? ''
@@ -720,13 +754,23 @@ async function runDoctorInner(dataDir: string, opts?: DoctorOptions): Promise<nu
   out(`  tls_tier:      ${formatTlsTierLine(tlsCfg.tlsTier, tlsCfg.tlsBrowser, wreqAvailable)}`);
 
   out('');
-  const reranker = checkReranker(dataDir);
+  const rerankerMode = getConfig().reranker;
+  const reranker = rerankerMode === 'onnx' ? checkReranker(dataDir) : null;
   const embeddings = checkFastembedCache(dataDir);
   out('[wigolo doctor] Optional components:');
-  if (reranker.installed) {
+  if (rerankerMode === 'remote') {
+    try {
+      new RemoteRerankProvider(getConfig());
+      out('  ML reranker:        remote configured (endpoint not probed)');
+    } catch (err) {
+      out(`  ML reranker:        ${err instanceof Error ? err.message : String(err)}`);
+    }
+  } else if (rerankerMode === 'none' || rerankerMode === 'custom') {
+    out('  ML reranker:        disabled');
+  } else if (reranker?.installed) {
     out(`  ML reranker:        installed (cross-encoder)`);
   } else {
-    out(`  ML reranker:        not installed${reranker.reason ? ` (${reranker.reason})` : ''}`);
+    out(`  ML reranker:        not installed${reranker?.reason ? ` (${reranker.reason})` : ''}`);
   }
   if (embeddings.installed) {
     out(`  Embeddings model:   installed (fastembed BGE-small-en-v1.5)`);
@@ -870,8 +914,7 @@ async function runDoctorInner(dataDir: string, opts?: DoctorOptions): Promise<nu
   } catch (err) {
     // Engine pool construction should never throw, but degrade gracefully if
     // a vertical fails to load — doctor must keep going.
-    const msg = err instanceof Error ? err.message : String(err);
-    out(`  (engine health summary failed: ${msg.slice(0, 80)})`);
+    out(`  (engine health summary failed: ${errorLine(err)})`);
   }
 
   // Opt-in live probe of every registered engine. Off by default —
@@ -879,8 +922,7 @@ async function runDoctorInner(dataDir: string, opts?: DoctorOptions): Promise<nu
   try {
     await runEngineProbeSection(opts?.probeEngines ?? false, getRegisteredEngineEntries());
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    out(`  (engine probes failed: ${msg.slice(0, 80)})`);
+    out(`  (engine probes failed: ${errorLine(err)})`);
   }
 
   // The search-engine sidecar sections only apply when the sidecar backend is
@@ -938,7 +980,13 @@ async function runDoctorInner(dataDir: string, opts?: DoctorOptions): Promise<nu
   }
 
   checkCoreEmbeddings(dataDir);
-  await checkSqliteVec(dataDir);
+  const sqliteCheck = await checkSqliteVec(dataDir);
+  if (sqliteCheck) {
+    // better-sqlite3 cannot load under this Node: the server cannot start
+    // either, and --fix cannot rebuild a native module for the user.
+    degraded = true;
+    nonFixableDegraded = true;
+  }
   checkCacheStats(dataDir);
   checkBackgroundQueue(dataDir);
   checkRssFeeds(dataDir);
@@ -983,7 +1031,9 @@ async function runDoctorInner(dataDir: string, opts?: DoctorOptions): Promise<nu
       exitCode,
       version: getVersion(),
       install_channel: detectInstallChannel(),
-      checks: fixableChecks,
+      // The ABI-mismatch check is not fixable, so it is not in fixableChecks;
+      // include it so a degraded --json report names its cause.
+      checks: sqliteCheck ? [...fixableChecks, sqliteCheck] : fixableChecks,
       fixes,
     };
     // Machine shape on stdout; the human diagnostic above stays on stderr.
@@ -1007,7 +1057,12 @@ function checkCoreEmbeddings(dataDir: string): void {
   }
 }
 
-async function checkSqliteVec(dataDir: string): Promise<void> {
+/**
+ * Returns a failed, non-fixable check when the SQLite native module itself
+ * cannot load under the running Node (ABI mismatch, #220/#654) — a hard
+ * failure for the server. Returns null otherwise.
+ */
+async function checkSqliteVec(dataDir: string): Promise<DoctorCheck | null> {
   out('');
   out('[wigolo doctor] Core sqlite-vec:');
   let opened = false;
@@ -1022,13 +1077,20 @@ async function checkSqliteVec(dataDir: string): Promise<void> {
       out('  extension:     not loaded (run warmup to load on next start)');
     }
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    out(`  extension:     (check failed: ${msg.slice(0, 80)})`);
+    if (isNativeAbiMismatch(err)) {
+      // The full explanation (running Node, built-for ABI, fixes) is the
+      // actionable part — print every line, not just the first.
+      out('  sqlite:        FAILED — native module built for a different Node.js');
+      for (const line of (err as Error).message.split('\n')) out(`    ${line}`);
+      return { name: 'sqlite', status: 'failed', fixable: false, detail: (err as Error).message };
+    }
+    out(`  extension:     (check failed: ${errorLine(err)})`);
   } finally {
     if (opened) {
       try { closeDatabase(); } catch { /* ignore */ }
     }
   }
+  return null;
 }
 
 function checkCacheStats(dataDir: string): void {
@@ -1048,8 +1110,7 @@ function checkCacheStats(dataDir: string): void {
       if (stats.newest) out(`  newest:        ${stats.newest}`);
     }
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    out(`  (check failed: ${msg.slice(0, 80)})`);
+    out(`  (check failed: ${errorLine(err)})`);
   } finally {
     if (opened) {
       try { closeDatabase(); } catch { /* ignore */ }
@@ -1072,8 +1133,7 @@ function checkBackgroundQueue(dataDir: string): void {
       out(`  pending:       ${pending} job(s) — draining on next worker tick`);
     }
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    out(`  (check failed: ${msg.slice(0, 80)})`);
+    out(`  (check failed: ${errorLine(err)})`);
   } finally {
     if (opened) {
       try { closeDatabase(); } catch { /* ignore */ }
@@ -1095,8 +1155,7 @@ function checkRssFeeds(dataDir: string): void {
     try {
       db = initDatabase(join(dataDir, 'wigolo.db'));
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      out(`  feeds:         ${feeds.length} configured (db unreadable: ${msg.slice(0, 60)})`);
+      out(`  feeds:         ${feeds.length} configured (db unreadable: ${errorLine(err)})`);
       return;
     }
 
@@ -1133,8 +1192,7 @@ function checkRssFeeds(dataDir: string): void {
               line = `  ${feed.url}  ${n} items, last fetched ${day} (${ageLabel}) [${fresh}]`;
             }
           } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            line = `  ${feed.url}  (check failed: ${msg.slice(0, 60)})`;
+            line = `  ${feed.url}  (check failed: ${errorLine(err)})`;
           }
         }
         out(line);
@@ -1143,8 +1201,7 @@ function checkRssFeeds(dataDir: string): void {
       try { closeDatabase(); } catch { /* ignore */ }
     }
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    out(`  (check failed: ${msg.slice(0, 80)})`);
+    out(`  (check failed: ${errorLine(err)})`);
   }
 }
 

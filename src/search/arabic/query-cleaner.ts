@@ -34,23 +34,12 @@
 // ---------------------------------------------------------------------------
 
 const LEADING_QUESTION_PREFIXES = [
-  // Direct question forms
+  // Direct question forms (specific before generic — the generic "من " rule
+  // below would otherwise swallow the opener and leave "فضلك" behind).
   /^من\s+هو\s+/i,
   /^من\s+هي\s+/i,
   /^مين\s+هو\s+/i,
   /^مين\s+هي\s+/i,
-  /^مين\s+/i,
-  /^من\s+/i,
-  /^ما\s+هو\s+/i,
-  /^ما\s+هي\s+/i,
-  /^ما\s+اسم\s+/i,
-  /^ما\s+اسم(?:\s+)?/i,
-  /^اسم\s+/i,
-  /^إيه\s+هو\s+/i,
-  /^ايه\s+هو\s+/i,
-  /^إيه\s+/i,
-  /^ايه\s+/i,
-  /^ما\s+/i,
   // Polite opener
   /^من\s+فضلك\s+/i,
   /^لو\s+سمحت\s+/i,
@@ -72,6 +61,20 @@ const LEADING_QUESTION_PREFIXES = [
   // Definition question
   /^ما\s+المقصود\s+بـ?/i,
   /^المقصود\s+بـ?/i,
+  // "ما اسم ..." / "اسم ..."
+  /^ما\s+اسم\s+/i,
+  /^ما\s+اسم(?:\s+)?/i,
+  /^اسم\s+/i,
+  /^ما\s+هو\s+/i,
+  /^ما\s+هي\s+/i,
+  /^إيه\s+هو\s+/i,
+  /^ايه\s+هو\s+/i,
+  // Generic single-word openers (last, so the specific forms above win).
+  /^مين\s+/i,
+  /^من\s+/i,
+  /^ما\s+/i,
+  /^إيه\s+/i,
+  /^ايه\s+/i,
 ];
 
 // ---------------------------------------------------------------------------
@@ -167,18 +170,25 @@ function stripLeadingPrefix(text: string): string {
 }
 
 function stripTrailingScaffolding(text: string): string {
-  const words = text.split(/\s+/);
+  const words = text.split(/\s+/).filter(Boolean);
   if (words.length <= 2) return text;
-  const core: string[] = [];
-  for (const word of words) {
-    // Strip leading "و" (Arabic "and") for the stopword check, because the
-    // trailing scaffolding is typically joined with "و".
+  // Scan from the END: only a TRAILING run of question scaffolding is
+  // removed. Matching from the front would cut the subject at the first
+  // scaffolding word — "تاريخ مصر من الفراعنة إلى اليوم" would collapse to
+  // "تاريخ مصر" even though "من الفراعنة" is part of the subject.
+  let end = words.length;
+  while (end > 0) {
+    const word = words[end - 1];
+    // Strip a leading "و" (Arabic "and") for the check, because the trailing
+    // scaffolding is typically joined with it ("وماذا").
     const stripped = word.startsWith("و") && word.length > 1 ? word.slice(1) : word;
     if (TRAILING_SCAFFOLDING_WORDS.has(stripped) || TRAILING_SCAFFOLDING_WORDS.has(word)) {
-      break;
+      end--;
+      continue;
     }
-    core.push(word);
+    break;
   }
+  const core = words.slice(0, end);
   // If stripping would leave less than 2 words, keep the full text — a
   // 1-word search query is too narrow.
   if (core.length < 2) return text;
@@ -230,11 +240,16 @@ export function cleanQueryForSearch(query: string): CleanedQuery {
   const original = String(query || "").trim();
   if (!original) return { searchQuery: "", subject: "", changed: false };
 
+  // Work on the diacritic-free form: a vocalized question
+  // ("مَنْ هِيَ ذات النطاقين") must still match the scaffolding patterns.
+  // Only the harakat are dropped — the user's spelling (أ/إ/آ) is kept.
+  const working = original.replace(DIACRITICS_RE, "");
+
   // Step 1: strip leading question prefix
-  let afterPrefix = stripLeadingPrefix(original);
+  let afterPrefix = stripLeadingPrefix(working);
 
   // Step 2: strip trailing question scaffolding
-  const subject = stripTrailingScaffolding(afterPrefix) || afterPrefix || original;
+  const subject = stripTrailingScaffolding(afterPrefix) || afterPrefix || working;
 
   // Step 3: remove body stopwords. Keep at most one round so we don't
   // over-strip.
@@ -247,7 +262,7 @@ export function cleanQueryForSearch(query: string): CleanedQuery {
     withStopwordsRemoved = subject;
   }
   if (!withStopwordsRemoved || withStopwordsRemoved.length < 3) {
-    withStopwordsRemoved = original;
+    withStopwordsRemoved = working;
   }
 
   const changed = withStopwordsRemoved !== original;
