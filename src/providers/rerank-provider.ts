@@ -134,15 +134,24 @@ export function _resetRerankProviderForTest(): void {
 
 // Best-effort disposal of the cached rerank provider's native resources.
 // Called from CLI shutdown to release the ONNX session before process exit.
+// Both language slots are disposed: the Arabic and the non-Arabic provider
+// are cached independently, so either one may hold an ONNX session.
 export async function disposeRerankProvider(): Promise<void> {
-  if (!cached) return;
-  try {
-    const provider = await cached;
-    const disposable = provider as unknown as { dispose?: () => Promise<void> };
-    if (typeof disposable.dispose === 'function') await disposable.dispose();
-  } catch (err) {
-    log.debug('rerank dispose failed', { error: err instanceof Error ? err.message : String(err) });
-  } finally {
-    cached = null;
-  }
+  const pending = [cachedArabic, cachedNonArabic].filter(
+    (p): p is Promise<RerankProvider> => p !== null,
+  );
+  cachedArabic = null;
+  cachedNonArabic = null;
+  if (pending.length === 0) return;
+  await Promise.all(
+    pending.map(async (promise) => {
+      try {
+        const provider = await promise;
+        const disposable = provider as unknown as { dispose?: () => Promise<void> };
+        if (typeof disposable.dispose === 'function') await disposable.dispose();
+      } catch (err) {
+        log.debug('rerank dispose failed', { error: err instanceof Error ? err.message : String(err) });
+      }
+    }),
+  );
 }
